@@ -5,11 +5,14 @@ package actions
 
 import (
 	"context"
+	"strconv"
+	"strings"
 	"time"
 
 	"code.gitea.io/gitea/models/actions"
 	"code.gitea.io/gitea/modules/log"
 	"code.gitea.io/gitea/modules/storage"
+	"code.gitea.io/gitea/modules/util"
 )
 
 // Cleanup removes expired actions logs, data and artifacts
@@ -25,7 +28,10 @@ func CleanupArtifacts(taskCtx context.Context) error {
 	if err := cleanExpiredArtifacts(taskCtx); err != nil {
 		return err
 	}
-	return cleanNeedDeleteArtifacts(taskCtx)
+	if err := cleanNeedDeleteArtifacts(taskCtx); err != nil {
+		return err
+	}
+	return cleanArtifactTemps(taskCtx)
 }
 
 func cleanExpiredArtifacts(taskCtx context.Context) error {
@@ -74,5 +80,43 @@ func cleanNeedDeleteArtifacts(taskCtx context.Context) error {
 			break
 		}
 	}
+	return nil
+}
+
+func cleanArtifactTemps(taskCtx context.Context) error {
+	storage.ActionsArtifacts.IterateObjects("", func(path string, obj storage.Object) error {
+		if !strings.HasPrefix(path, "tmp") {
+			return nil
+		}
+		topDirName := strings.Split(path, "/")[0]
+		runIDStr := strings.TrimPrefix(topDirName, "tmp")
+		runID, _ := strconv.ParseInt(runIDStr, 10, 64)
+
+		run, err := actions.GetRunByID(taskCtx, runID)
+		if err != nil {
+			// record not found, delete this chunk
+			if strings.Contains(err.Error(), util.ErrNotExist.Error()) {
+				log.Warn("Run %d not found, clean up: %s", runID, path)
+				if err := storage.ActionsArtifacts.Delete(path); err != nil {
+					log.Warn("Cannot delete %s: %v", path, err)
+					return err
+				}
+				return storage.ActionsArtifacts.Delete(topDirName)
+			}
+			log.Warn("Cannot get run %d: %v", runID, err)
+			return nil
+		}
+
+		if run.Status == actions.StatusWaiting || run.Status == actions.StatusRunning {
+			log.Debug("Run %d is still running, skip cleaning", runID)
+			return nil
+		}
+		log.Info("Run %d is not running, clean up: %s", path)
+		if err := storage.ActionsArtifacts.Delete(path); err != nil {
+			log.Warn("Cannot delete %s: %v", path, err)
+			return err
+		}
+		return storage.ActionsArtifacts.Delete(topDirName)
+	})
 	return nil
 }
